@@ -29,6 +29,7 @@ import org.apache.flink.table.factories.TableFormatFactory;
 import org.apache.flink.table.sources.RowtimeAttributeDescriptor;
 import org.apache.flink.table.sources.tsextractors.TimestampExtractor;
 import org.apache.flink.table.sources.wmstrategies.WatermarkStrategy;
+import org.apache.flink.table.utils.TableSchemaUtils;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -38,6 +39,11 @@ import java.util.Map;
 import java.util.Optional;
 
 import static java.lang.String.format;
+import static org.apache.flink.table.descriptors.DescriptorProperties.TABLE_SCHEMA_EXPR;
+import static org.apache.flink.table.descriptors.DescriptorProperties.WATERMARK;
+import static org.apache.flink.table.descriptors.DescriptorProperties.WATERMARK_ROWTIME;
+import static org.apache.flink.table.descriptors.DescriptorProperties.WATERMARK_STRATEGY_DATA_TYPE;
+import static org.apache.flink.table.descriptors.DescriptorProperties.WATERMARK_STRATEGY_EXPR;
 import static org.apache.flink.table.descriptors.Rowtime.ROWTIME;
 import static org.apache.flink.table.descriptors.Rowtime.ROWTIME_TIMESTAMPS_CLASS;
 import static org.apache.flink.table.descriptors.Rowtime.ROWTIME_TIMESTAMPS_FROM;
@@ -49,6 +55,7 @@ import static org.apache.flink.table.descriptors.Rowtime.ROWTIME_WATERMARKS_DELA
 import static org.apache.flink.table.descriptors.Rowtime.ROWTIME_WATERMARKS_SERIALIZED;
 import static org.apache.flink.table.descriptors.Rowtime.ROWTIME_WATERMARKS_TYPE;
 import static org.apache.flink.table.descriptors.Schema.SCHEMA;
+import static org.apache.flink.table.descriptors.Schema.SCHEMA_DATA_TYPE;
 import static org.apache.flink.table.descriptors.Schema.SCHEMA_FROM;
 import static org.apache.flink.table.descriptors.Schema.SCHEMA_NAME;
 import static org.apache.flink.table.descriptors.Schema.SCHEMA_PROCTIME;
@@ -74,18 +81,19 @@ public class SchemaValidator implements DescriptorValidator {
 	@Override
 	public void validate(DescriptorProperties properties) {
 		Map<String, String> names = properties.getIndexedProperty(SCHEMA, SCHEMA_NAME);
-		Map<String, String> types = properties.getIndexedProperty(SCHEMA, SCHEMA_TYPE);
+		Map<String, String> legacyTypes = properties.getIndexedProperty(SCHEMA, SCHEMA_TYPE);
+		Map<String, String> dataTypes = properties.getIndexedProperty(SCHEMA, SCHEMA_DATA_TYPE);
 
-		if (names.isEmpty() && types.isEmpty()) {
+		if (names.isEmpty() && legacyTypes.isEmpty() && dataTypes.isEmpty()) {
 			throw new ValidationException(
 					format("Could not find the required schema in property '%s'.", SCHEMA));
 		}
 
 		boolean proctimeFound = false;
 
-		for (int i = 0; i < Math.max(names.size(), types.size()); i++) {
+		for (int i = 0; i < Math.max(names.size(), legacyTypes.size()); i++) {
 			properties.validateString(SCHEMA + "." + i + "." + SCHEMA_NAME, false, 1);
-			properties.validateType(SCHEMA + "." + i + "." + SCHEMA_TYPE, false, false);
+			properties.validateDataType(SCHEMA + "." + i + "." + SCHEMA_DATA_TYPE, SCHEMA + "." + i + "." + SCHEMA_TYPE, false);
 			properties.validateString(SCHEMA + "." + i + "." + SCHEMA_FROM, true, 1);
 			// either proctime or rowtime
 			String proctime = SCHEMA + "." + i + "." + SCHEMA_PROCTIME;
@@ -126,9 +134,12 @@ public class SchemaValidator implements DescriptorValidator {
 		List<String> keys = new ArrayList<>();
 
 		// schema
+		keys.add(SCHEMA + ".#." + SCHEMA_DATA_TYPE);
 		keys.add(SCHEMA + ".#." + SCHEMA_TYPE);
 		keys.add(SCHEMA + ".#." + SCHEMA_NAME);
 		keys.add(SCHEMA + ".#." + SCHEMA_FROM);
+		// computed column
+		keys.add(SCHEMA + ".#." + TABLE_SCHEMA_EXPR);
 
 		// time attributes
 		keys.add(SCHEMA + ".#." + SCHEMA_PROCTIME);
@@ -140,6 +151,11 @@ public class SchemaValidator implements DescriptorValidator {
 		keys.add(SCHEMA + ".#." + ROWTIME_WATERMARKS_CLASS);
 		keys.add(SCHEMA + ".#." + ROWTIME_WATERMARKS_SERIALIZED);
 		keys.add(SCHEMA + ".#." + ROWTIME_WATERMARKS_DELAY);
+
+		// watermark
+		keys.add(SCHEMA + "." + WATERMARK + ".#."  + WATERMARK_ROWTIME);
+		keys.add(SCHEMA + "." + WATERMARK + ".#."  + WATERMARK_STRATEGY_EXPR);
+		keys.add(SCHEMA + "." + WATERMARK + ".#."  + WATERMARK_STRATEGY_DATA_TYPE);
 
 		return keys;
 	}
@@ -197,7 +213,7 @@ public class SchemaValidator implements DescriptorValidator {
 	public static TableSchema deriveTableSinkSchema(DescriptorProperties properties) {
 		TableSchema.Builder builder = TableSchema.builder();
 
-		TableSchema schema = properties.getTableSchema(SCHEMA);
+		TableSchema schema = TableSchemaUtils.getPhysicalSchema(properties.getTableSchema(SCHEMA));
 
 		for (int i = 0; i < schema.getFieldCount(); i++) {
 			TypeInformation t = schema.getFieldTypes()[i];
@@ -245,7 +261,7 @@ public class SchemaValidator implements DescriptorValidator {
 
 		Map<String, String> mapping = new HashMap<>();
 
-		TableSchema schema = properties.getTableSchema(SCHEMA);
+		TableSchema schema = TableSchemaUtils.getPhysicalSchema(properties.getTableSchema(SCHEMA));
 
 		List<String> columnNames = new ArrayList<>();
 		inputType.ifPresent(t -> columnNames.addAll(Arrays.asList(((CompositeType) t).getFieldNames())));
@@ -266,12 +282,14 @@ public class SchemaValidator implements DescriptorValidator {
 				mapping.put(name, source.get());
 			} else { // implicit mapping or time
 				boolean isProctime = properties
-						.getOptionalBoolean(SCHEMA + "." + i + "." + SCHEMA_PROCTIME)
-						.orElse(false);
+					.getOptionalBoolean(SCHEMA + "." + i + "." + SCHEMA_PROCTIME)
+					.orElse(false);
 				boolean isRowtime = properties
-						.containsKey(SCHEMA + "." + i + "." + ROWTIME_TIMESTAMPS_TYPE);
+					.containsKey(SCHEMA + "." + i + "." + ROWTIME_TIMESTAMPS_TYPE);
+				boolean isGeneratedColumn = properties
+					.containsKey(SCHEMA + "." + i + "." + TABLE_SCHEMA_EXPR);
 				// remove proctime/rowtime from mapping
-				if (isProctime || isRowtime) {
+				if (isProctime || isRowtime || isGeneratedColumn) {
 					mapping.remove(name);
 				}
 				// check for invalid fields

@@ -161,7 +161,6 @@ public class JobManagerHAProcessFailureRecoveryITCase extends TestLogger {
 		env.setParallelism(PARALLELISM);
 		env.setRestartStrategy(RestartStrategies.fixedDelayRestart(1, 0L));
 		env.getConfig().setExecutionMode(executionMode);
-		env.getConfig().disableSysoutLogging();
 
 		final long numElements = 100000L;
 		final DataSet<Long> result = env.generateSequence(1, numElements)
@@ -253,6 +252,7 @@ public class JobManagerHAProcessFailureRecoveryITCase extends TestLogger {
 		config.setString(TaskManagerOptions.MANAGED_MEMORY_SIZE, "4m");
 		config.setInteger(NettyShuffleEnvironmentOptions.NETWORK_NUM_BUFFERS, 100);
 		config.setInteger(TaskManagerOptions.NUM_TASK_SLOTS, 2);
+		config.setString(TaskManagerOptions.TOTAL_FLINK_MEMORY, "512m");
 
 		final RpcService rpcService = AkkaRpcServiceUtils.createRpcService("localhost", 0, config);
 
